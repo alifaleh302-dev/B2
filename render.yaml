@@ -1,0 +1,47 @@
+services:
+  - type: web
+    name: webook-sniper-bot
+    env: docker
+    plan: free
+    region: frankfurt
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    autoDeploy: true
+    pullRequestPreviewsEnabled: false
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: AUTHORIZED_CHAT_IDS
+        sync: false
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: PORT
+        value: "10000"
+      - key: KEEP_ALIVE_ENABLED
+        value: "true"
+      - key: KEEP_ALIVE_INTERVAL
+        value: "600"
+      - key: EVENT_POLL_INTERVAL
+        value: "300"
+      - key: SNIPER_POLL_INTERVAL
+        value: "2"
+      - key: HEADLESS
+        value: "true"
+      - key: LOG_LEVEL
+        value: "INFO"
+      - key: WEBOOK_LANG
+        value: "ar"
+
+      # ---- Persistent PostgreSQL storage ----
+      # Primary storage on an external PostgreSQL instance.
+      # Set via Render dashboard → Environment → DATABASE_URL.
+      - key: DATABASE_URL
+        sync: false
+
+      # ---- Optional fallback: Turso cloud SQLite ----
+      - key: TURSO_DATABASE_URL
+        sync: false
+      - key: TURSO_AUTH_TOKEN
+        sync: false
