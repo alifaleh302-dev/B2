@@ -23,10 +23,12 @@ from app.core.config import (
     target_blocks,
     default_payment_method,
 )
-from app.services.seatsio_client import SeatsioClient
+from app.services.seatsio_client import (
+    SeatsioClient, get_hold_token_from_webook,
+)
 from app.services.seatsio_runtime import ensure_event_warm, get_snapshot
 from app.services.block_analyzer import (
-    extract_blocks, find_seats_with_fallback,
+    extract_blocks, find_seats_with_fallback, chart_is_sold_out,
 )
 
 log = logging.getLogger("booking_http")
@@ -144,17 +146,52 @@ async def resolve_seated_manifest(
     ticket_meta: Optional[dict[str, Any]] = None,
     event_meta: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
+    """Extract everything we need to drive seats.io for this event:
+      - event_key, chart_key, workspace_key (from webook's `seats_io` blob)
+      - seats_provider                       ('seats_planner' | 'seatsio')
+      - category (= seats_io_category for the chosen ticket type)
+      - event_id (= webook's _id, needed for hold-token endpoint)
+    """
     raw_tickets = await fetch_raw_ticket_details(session, slug, bearer)
     raw_ticket = _find_ticket_blob(raw_tickets, ticket_id)
     raw_event = ((raw_tickets or {}).get("data") or {}).get("event") or {}
     meta_raw = (event_meta or {}).get("raw") or {}
 
+    # Prefer the structured `seats_io` blob (webook returns it for both
+    # seatsio and seats_planner events)
+    seats_io_blob = (
+        meta_raw.get("seats_io")
+        or raw_event.get("seats_io")
+        or {}
+    )
+    if not isinstance(seats_io_blob, dict):
+        seats_io_blob = {}
+
     event_key = (
-        _deep_find_first(raw_ticket, SEATED_EVENT_KEY_CANDIDATES)
-        or _deep_find_first(raw_event, SEATED_EVENT_KEY_CANDIDATES)
-        or _deep_find_first(meta_raw, SEATED_EVENT_KEY_CANDIDATES)
+        seats_io_blob.get("event_key")
+        or _deep_find_first(raw_ticket, SEATED_EVENT_KEY_CANDIDATES - {"chart_key", "chartKey"})
+        or _deep_find_first(raw_event, SEATED_EVENT_KEY_CANDIDATES - {"chart_key", "chartKey"})
+        or _deep_find_first(meta_raw, SEATED_EVENT_KEY_CANDIDATES - {"chart_key", "chartKey"})
         or ""
     )
+    chart_key = (
+        seats_io_blob.get("chart_key")
+        or _deep_find_first(meta_raw, {"chart_key", "chartKey"})
+        or _deep_find_first(raw_event, {"chart_key", "chartKey"})
+        or ""
+    )
+    workspace_key = (
+        seats_io_blob.get("workspace_key")
+        or _deep_find_first(meta_raw, {"workspace_key", "workspaceKey"})
+        or ""
+    )
+    seats_provider = (
+        meta_raw.get("seats_provider")
+        or raw_event.get("seats_provider")
+        or ""
+    )
+    event_id = meta_raw.get("_id") or raw_event.get("_id") or ""
+
     category = (
         (ticket_meta or {}).get("seats_io_category")
         or raw_ticket.get("seats_io_category")
@@ -164,6 +201,10 @@ async def resolve_seated_manifest(
     )
     return {
         "event_key": str(event_key or "").strip(),
+        "chart_key": str(chart_key or "").strip(),
+        "workspace_key": str(workspace_key or "").strip(),
+        "seats_provider": str(seats_provider or "").strip(),
+        "event_id": str(event_id or "").strip(),
         "category": str(category or "").strip(),
         "raw_ticket": raw_ticket,
         "raw_event": raw_event,
@@ -283,34 +324,84 @@ async def _reserve_seated_inventory(
     quantity: int,
     bearer: str,
     manifest: dict[str, Any],
+    event_id: str = "",
     primary_block: str = "",
     backup_blocks: Optional[list[str]] = None,
+    turnstile_token: str = "",
 ) -> tuple[Optional[dict[str, Any]], list[str], dict[str, Any]]:
-    """Reserve seats with the Hydra engine.
+    """Reserve seats via the Hydra engine.
 
     Returns: (seat_payload | None, logs, meta)
-        meta contains: 'block_used', 'rendering_info', 'statuses',
-                       'event_key', 'no_seats_anywhere'
+        meta keys:
+          - 'event_key', 'workspace_key', 'chart_key'
+          - 'block_used'
+          - 'rendering_info', 'statuses'
+          - 'chart_full'      → True ONLY if chart data was retrieved AND
+                                 every block reports 0 free capacity.
+                                 (Caller routes to drop-watcher when True.)
+          - 'chart_unreachable'→ True when seats.io APIs failed entirely.
+                                 (Caller should NOT engage drop-watcher; the
+                                 booking should error with a transient msg.)
+          - 'turnstile_required' → True when webook hold-token requires
+                                    a Cloudflare Turnstile token.
+          - 'queued', 'queue_position' → webook queue state when present.
     """
     logs: list[str] = []
-    meta: dict[str, Any] = {"event_key": manifest.get("event_key") or "",
-                            "block_used": "",
-                            "no_seats_anywhere": False}
-    event_key = manifest.get("event_key") or ""
+    event_key = (manifest.get("event_key") or "").strip()
+    workspace_key = (manifest.get("workspace_key") or "").strip()
+    chart_key = (manifest.get("chart_key") or "").strip()
+    provider = (manifest.get("seats_provider") or "").strip()
+
+    meta: dict[str, Any] = {
+        "event_key": event_key,
+        "workspace_key": workspace_key,
+        "chart_key": chart_key,
+        "block_used": "",
+        "chart_full": False,
+        "chart_unreachable": False,
+        "turnstile_required": False,
+        "queued": False,
+    }
     if not event_key:
+        meta["chart_unreachable"] = True
+        logs.append("⚠️ manifest has no event_key")
         return None, logs, meta
 
     backup_blocks = backup_blocks or []
-    # Legacy ENV-level fallback (lower priority than user-picked blocks)
     legacy_targets = target_blocks()
 
+    # ── Step 1: get a hold-token from webook (preferred for seats_planner) ──
+    webook_hold_token = ""
+    if event_id:
+        ht, ht_meta = await get_hold_token_from_webook(
+            slug=slug, event_id=event_id, bearer=bearer,
+            turnstile=turnstile_token,
+        )
+        if ht_meta.get("turnstile_required"):
+            meta["turnstile_required"] = True
+            logs.append("⚠️ webook hold-token requires Turnstile")
+        if ht_meta.get("queued"):
+            meta["queued"] = True
+            meta["queue_position"] = ht_meta.get("waiting_number")
+            logs.append(f"⏳ in queue at position {ht_meta.get('waiting_number')}")
+        if ht:
+            webook_hold_token = ht
+            logs.append(f"🔑 hold-token from webook: …{ht[-8:]}")
+
+    # ── Step 2: try cached snapshot first (fastest path) ──
     await ensure_event_warm(event_key)
     snapshot = get_snapshot(event_key)
+    rendering_info = (snapshot or {}).get("rendering_info") if snapshot else None
+    statuses = (snapshot or {}).get("statuses") if snapshot else None
 
-    async with SeatsioClient(event_key) as client:
-        # Try snapshot first (fastest)
-        rendering_info = (snapshot or {}).get("rendering_info") if snapshot else None
-        statuses = (snapshot or {}).get("statuses") if snapshot else None
+    # ── Step 3: open client with all keys + hold-token ──
+    async with SeatsioClient(
+        event_key=event_key,
+        workspace_key=workspace_key,
+        chart_key=chart_key,
+        provider=provider,
+        hold_token=webook_hold_token,
+    ) as client:
         if rendering_info is None:
             rendering_info = await client.rendering_info()
         if statuses is None:
@@ -319,7 +410,13 @@ async def _reserve_seated_inventory(
         meta["rendering_info"] = rendering_info
         meta["statuses"] = statuses
 
-        # Decide block preferences
+        # No chart data at all? → transient error, NOT chart-full
+        if not rendering_info or not (rendering_info.get("objects") or []):
+            meta["chart_unreachable"] = True
+            logs.append("⚠️ seats.io returned no chart data — transient/network error")
+            return None, logs, meta
+
+        # ── Step 4: pick seats ──
         primary = primary_block or (legacy_targets[0] if legacy_targets else "")
         backups = backup_blocks or legacy_targets[1:]
 
@@ -333,37 +430,51 @@ async def _reserve_seated_inventory(
         )
 
         if not seat_ids:
-            # Detect whether the chart is genuinely full (drop-watcher case)
-            blocks_meta = extract_blocks(rendering_info, statuses)
-            total_free = sum(b.get("free", 0) for b in blocks_meta)
-            meta["no_seats_anywhere"] = (total_free == 0)
-            logs.append(f"🚫 no contiguous {quantity} seats available "
-                        f"(total free in chart: {total_free})")
+            # Distinguish 'truly sold out' from 'no contiguous run for this qty'
+            if chart_is_sold_out(rendering_info, statuses):
+                meta["chart_full"] = True
+                logs.append("🚫 chart is genuinely sold out")
+            else:
+                logs.append(f"🔍 no contiguous run of {quantity} found in "
+                            f"primary/backup/neighbors")
             return None, logs, meta
 
         meta["block_used"] = used_block
-        try:
-            await client.init_hold_token()
-            hold_result = await client.hold_objects(
-                seat_ids, ticket_type=manifest.get("category") or "",
-            )
-            errors = hold_result.get("errors") if isinstance(hold_result, dict) else None
-            if errors:
-                logs.append(f"hold errors on block={used_block}: {str(errors)[:100]}")
-                return None, logs, meta
-        except Exception as e:
-            logs.append(f"hold raise on block={used_block}: {str(e)[:120]}")
-            return None, logs, meta
 
-        logs.append(f"🪑 held {len(seat_ids)} seats from block={used_block}")
-        return {
-            "selected_seats": seat_ids,
-            "selected_seat_labels": seat_ids,
-            "hold_token": client.hold_token,
-            "seat_hold_token": client.hold_token,
-            "holdToken": client.hold_token,
-            "seats_io_category": manifest.get("category") or "",
-        }, logs, meta
+        # ── Step 5: pre-hold via legacy adapter (best-effort) ──
+        # For seats_planner generalAdmission, the actual seat assignment
+        # happens server-side at checkout — so a 'failed pre-hold' here is
+        # NOT fatal. We log it and let webook do its thing.
+        used_token = webook_hold_token
+        try:
+            if not used_token:
+                used_token = await client.init_hold_token()
+            if rendering_info.get("_provider") != "seats_planner":
+                # Only legacy charts support the actions/hold endpoint
+                hold_result = await client.hold_objects(
+                    seat_ids, ticket_type=manifest.get("category") or "",
+                )
+                errors = hold_result.get("errors") if isinstance(hold_result, dict) else None
+                if errors:
+                    logs.append(f"⚠️ legacy hold reported: {str(errors)[:100]}")
+        except Exception as e:
+            logs.append(f"⚠️ pre-hold soft-fail: {str(e)[:120]} (continuing)")
+
+        if used_token:
+            logs.append(f"🪑 selected {len(seat_ids)} seats in block={used_block}")
+            return {
+                "selected_seats": seat_ids,
+                "selected_seat_labels": seat_ids,
+                "hold_token": used_token,
+                "seat_hold_token": used_token,
+                "holdToken": used_token,
+                "seats_io_category": manifest.get("category") or "",
+            }, logs, meta
+
+        # No hold-token available (webook didn't issue one and legacy POST failed)
+        meta["chart_unreachable"] = True
+        logs.append("⚠️ could not obtain hold-token — cannot proceed")
+        return None, logs, meta
 
 
 async def book_ticket_http(
@@ -398,6 +509,12 @@ async def book_ticket_http(
         "seat_info": {},
         "seat_objects": [],     # rich objects with category/block/row/seat for summarizer
         "block_used": "",
+        # Fine-grained failure signals (used by orchestrator):
+        "chart_full": False,         # chart genuinely sold out (drop-watcher)
+        "chart_unreachable": False,  # transient seats.io failure (NO drop-watcher)
+        "turnstile_required": False, # webook needs Cloudflare Turnstile token
+        "queued": False,             # webook queue active
+        # Legacy compat (kept so external callers don't break):
         "no_seats_anywhere": False,
         "logs": [],
         "error": "",
@@ -456,6 +573,7 @@ async def book_ticket_http(
                     quantity=quantity,
                     bearer=bearer,
                     manifest=manifest,
+                    event_id=event_id,
                     primary_block=primary_block,
                     backup_blocks=backup_blocks,
                 )
@@ -463,7 +581,12 @@ async def book_ticket_http(
                 rendering_info_for_summary = seat_meta.get("rendering_info")
                 statuses_for_summary = seat_meta.get("statuses")
                 result["block_used"] = seat_meta.get("block_used", "")
-                result["no_seats_anywhere"] = bool(seat_meta.get("no_seats_anywhere"))
+                result["chart_full"] = bool(seat_meta.get("chart_full"))
+                result["chart_unreachable"] = bool(seat_meta.get("chart_unreachable"))
+                result["turnstile_required"] = bool(seat_meta.get("turnstile_required"))
+                result["queued"] = bool(seat_meta.get("queued"))
+                # legacy compat — only when truly full (NOT on transient errors)
+                result["no_seats_anywhere"] = result["chart_full"]
 
                 if seat_payload:
                     result["seat_info"] = {
@@ -471,18 +594,35 @@ async def book_ticket_http(
                         "hold_token": seat_payload.get("hold_token") or "",
                         "category": manifest.get("category") or "",
                         "event_key": manifest.get("event_key") or "",
+                        "chart_key": manifest.get("chart_key") or "",
+                        "workspace_key": manifest.get("workspace_key") or "",
                         "block": result["block_used"],
                     }
                 else:
-                    if result["no_seats_anywhere"]:
+                    if result["turnstile_required"]:
+                        result["error"] = (
+                            "هذه الفعالية تتطلب تحقق Cloudflare Turnstile. افتح الفعالية "
+                            "في المتصفح لإصدار رمز التحقق أولاً، ثم أعد المحاولة."
+                        )
+                    elif result["queued"]:
+                        pos = seat_meta.get("queue_position") or "?"
+                        result["error"] = (
+                            f"الفعالية في طابور الانتظار (رقمك: {pos}). البوت سيعيد المحاولة تلقائياً."
+                        )
+                    elif result["chart_full"]:
                         result["error"] = "الخريطة ممتلئة بالكامل — يمكنك تفعيل وضع الترقّب"
-                        # caller will register a drop_watcher
-                        result["seat_info"] = {
-                            "event_key": manifest.get("event_key") or "",
-                            "category": manifest.get("category") or "",
-                        }
+                    elif result["chart_unreachable"]:
+                        result["error"] = "تعذّر جلب بيانات خريطة المقاعد (خطأ شبكي، أعد المحاولة)."
                     else:
-                        result["error"] = "تعذّر إيجاد مقاعد متجاورة بالعدد المطلوب"
+                        result["error"] = (
+                            f"تعذّر إيجاد {quantity} مقعداً متجاورًا في البلوكات المختارة أو المجاورة."
+                        )
+                    result["seat_info"] = {
+                        "event_key": manifest.get("event_key") or "",
+                        "chart_key": manifest.get("chart_key") or "",
+                        "workspace_key": manifest.get("workspace_key") or "",
+                        "category": manifest.get("category") or "",
+                    }
                     return result
             else:
                 result["logs"].append("⚠️ no SeatCloud event key found — fallback only")

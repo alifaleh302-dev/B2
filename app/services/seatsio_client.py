@@ -1,16 +1,39 @@
 """
-SeatCloud / Seats.io client for Webook seated events.
+SeatCloud / Seats.io client — v2 (seats_planner provider).
 
-It provides:
-  • public rendering info discovery
-  • object status polling
-  • hold-token creation
-  • adjacent-seat picking with preferred blocks
-  • optional WebSocket subscription for fast seat-release tracking
+Discovery (via browser sniffing of webook.com /book pages):
+
+  • Webook now uses two providers behind the same `seats_io` blob:
+      - 'seatsio'        → legacy chart with /system/public/{ws}/...
+      - 'seats_planner'  → new chart with /api/v2/{ws}/...   ← MOST EVENTS
+
+  • For seats_planner the actual endpoints are:
+      GET  /api/v2/{ws}/event/{event_key}
+            → event meta + specifications (= ticket categories)
+      GET  /api/v2/{ws}/event/{event_key}/items?hold_token=X
+            → seat statuses (booked/free) — 204 when there are no held items
+      GET  /api/v2/{ws}/map/{chart_key}/data
+            → full chart data: levels[], content.areas[], content.images[]
+      POST /api/v1/team/{ws}/hold-tokens/public/generate
+            → can also obtain a hold-token (we prefer webook's hold-token
+              endpoint though, see WebookHoldTokenSource)
+
+  • The hold-token MUST come from webook.com first when the chart is
+    behind the queue/turnstile gate:
+      POST /api/v2/event-detail/{slug}/hold-token   (Bearer required)
+            body: {"event_id": "...", "lang": "en"[, "turnstile": "..."]}
+
+This module exposes a unified `SeatsioClient` that:
+  • Works for both providers transparently.
+  • Returns rendering_info shaped like seats.io's classic API so the rest
+    of the codebase (block_analyzer, summarizer, …) keeps working.
+  • Falls back gracefully when the network/endpoint fails — never claims
+    "chart full" on connectivity errors.
 """
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import logging
 import re
@@ -20,31 +43,340 @@ from urllib.parse import urlencode
 
 import aiohttp
 
-from app.core.config import WEBOOK_ORIGIN
+from app.core.config import WEBOOK_API, WEBOOK_ORIGIN
 from app.services.seatsio_token_fetcher import ensure_tokens
 
 log = logging.getLogger("seatsio_client")
 
+# Modern (seats_planner) base
 SEATCLOUD_API = "https://api.seatcloud.com"
+# Legacy (seatsio) base — kept as fallback
+SEATSIO_LEGACY_API = "https://api.seatcloud.com"
+
+DEFAULT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+)
 
 
-def _headers(hold_token: str = "") -> dict[str, str]:
+# ════════════════════════════════════════════════════════════════════════
+# Helpers
+# ════════════════════════════════════════════════════════════════════════
+def _trace_id() -> str:
+    return f"{int(time.time()*1000)}-{int(time.time()*1e6) % 100000:05d}"
+
+
+def _chart_headers(hold_token: str = "") -> dict[str, str]:
+    h = {
+        "accept": "application/json",
+        "accept-encoding": "gzip, deflate",
+        "user-agent": DEFAULT_UA,
+        "origin": "https://chart.seatcloud.com",
+        "referer": "https://chart.seatcloud.com/",
+        "accept-language": "ar-SA,ar;q=0.9,en;q=0.8",
+    }
+    if hold_token:
+        h["x-hold-token"] = hold_token
+    return h
+
+
+def _legacy_headers(hold_token: str = "") -> dict[str, str]:
     h = {
         "accept": "application/json, text/plain, */*",
         "content-type": "application/json",
+        "user-agent": DEFAULT_UA,
         "origin": WEBOOK_ORIGIN,
         "referer": f"{WEBOOK_ORIGIN}/",
-        "user-agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/128.0.0.0 Safari/537.36"
-        ),
         "accept-language": "ar-SA,ar;q=0.9,en;q=0.8",
         "x-client-tool": "chart-renderer",
     }
     if hold_token:
         h["x-hold-token"] = hold_token
     return h
+
+
+async def _read_json(resp: aiohttp.ClientResponse) -> Any:
+    """Read possibly-gzipped JSON safely."""
+    raw = await resp.read()
+    if raw[:2] == b"\x1f\x8b":
+        try:
+            raw = gzip.decompress(raw)
+        except Exception:
+            pass
+    txt = raw.decode("utf-8", errors="replace")
+    if not txt.strip():
+        return None
+    try:
+        return json.loads(txt)
+    except Exception:
+        return {"raw": txt[:500]}
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Webook hold-token source (preferred for seats_planner events)
+# ════════════════════════════════════════════════════════════════════════
+async def get_hold_token_from_webook(
+    *,
+    slug: str,
+    event_id: str,
+    bearer: str,
+    turnstile: str = "",
+    time_slot_id: str = "",
+) -> tuple[Optional[str], dict]:
+    """Request a hold-token from webook.
+
+    Returns (token, meta) where meta carries:
+      - 'queued': bool, 'waiting_number': int, 'total_in_queue': int  (queue state)
+      - 'turnstile_required': bool
+      - 'errors': dict (validation errors)
+      - 'http_status': int
+    """
+    meta: dict[str, Any] = {"queued": False, "turnstile_required": False,
+                             "http_status": 0}
+    if not bearer or not slug or not event_id:
+        return None, meta
+
+    url = f"{WEBOOK_API}/event-detail/{slug}/hold-token?lang=en"
+    body: dict[str, Any] = {"event_id": event_id, "lang": "en"}
+    if turnstile:
+        body["turnstile"] = turnstile
+    if time_slot_id:
+        body["time_slot_id"] = time_slot_id
+
+    headers = {
+        "accept": "application/json",
+        "accept-encoding": "gzip, deflate",
+        "content-type": "application/json",
+        "user-agent": DEFAULT_UA,
+        "origin": WEBOOK_ORIGIN,
+        "referer": f"{WEBOOK_ORIGIN}/",
+        "authorization": f"Bearer {bearer}",
+    }
+    # Pull the public token lazily to avoid import cycles
+    try:
+        from app.core.config import webook_public_token
+        headers["token"] = webook_public_token()
+    except Exception:
+        pass
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url, headers=headers, json=body,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as r:
+                meta["http_status"] = r.status
+                d = await _read_json(r) or {}
+
+        # 422 turnstile
+        if isinstance(d, dict) and d.get("errors", {}).get("turnstile"):
+            meta["turnstile_required"] = True
+            meta["errors"] = d.get("errors")
+            return None, meta
+
+        if not isinstance(d, dict):
+            return None, meta
+
+        q = d.get("_queue") or {}
+        if q.get("queued"):
+            meta["queued"] = True
+            meta["waiting_number"] = q.get("waiting_number")
+            meta["total_in_queue"] = q.get("total_in_queue")
+
+        token = (d.get("data") or {}).get("token") or d.get("token")
+        if isinstance(token, str) and token:
+            return token, meta
+        # Some responses bury the token deeper
+        if isinstance(d, dict):
+            for key in ("hold_token", "holdToken", "seat_hold_token"):
+                v = d.get(key) or (d.get("data") or {}).get(key)
+                if isinstance(v, str) and v:
+                    return v, meta
+        return None, meta
+    except Exception as e:
+        log.debug(f"webook hold-token error: {e}")
+        return None, meta
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Map normalisation: seats_planner → seats.io rendering_info shape
+# ════════════════════════════════════════════════════════════════════════
+def _norm_specifications(event_data: dict, map_data: dict) -> list[dict]:
+    """Merge category list from event + map (event has more accurate names)."""
+    out: list[dict] = []
+    seen_keys: set = set()
+
+    for sp in (event_data.get("specifications") or []):
+        if isinstance(sp, dict):
+            key = sp.get("id") if "id" in sp else sp.get("key")
+            label = sp.get("name") or sp.get("label") or ""
+            color = sp.get("color") or ""
+            if key is not None:
+                seen_keys.add(int(key))
+                out.append({"key": int(key), "label": str(label), "color": color})
+
+    for sp in (map_data.get("specifications") or []):
+        if isinstance(sp, dict):
+            key = sp.get("key") if "key" in sp else sp.get("id")
+            if key is None or int(key) in seen_keys:
+                continue
+            label = sp.get("name") or sp.get("label") or ""
+            color = sp.get("color") or ""
+            seen_keys.add(int(key))
+            out.append({"key": int(key), "label": str(label), "color": color})
+    return out
+
+
+def _norm_objects_from_areas(map_data: dict, statuses: dict[str, str],
+                              event_data: dict | None = None) -> list[dict]:
+    """Convert seats_planner area list → seats.io-style objects[].
+
+    Each generalAdmission area becomes a synthetic 'block' object with:
+      • id        = area.id
+      • label     = area.name
+      • category  = specification.label (e.g. 'CAT 3 - N')
+      • categoryKey = specification.key
+      • capacity  = occupancy.capacity
+      • status    = looked up in statuses[area.id]
+      • center.x/y = geometry.center.x/y (for geometric expansion)
+
+    NOTE on availability:
+      The `occupancy.availableForSale` flag in the map is a DESIGN-TIME
+      default — the live state comes from the event's spec list and the
+      /items endpoint. We expose `is_for_sale` based on whether the area's
+      specification key appears in event.specifications (= ticket types
+      currently being sold).
+    """
+    content = map_data.get("content") or {}
+    areas = content.get("areas") or []
+
+    # Build set of currently-sold spec keys from event.specifications
+    sold_spec_keys: set[int] = set()
+    if isinstance(event_data, dict):
+        for sp in (event_data.get("specifications") or []):
+            if isinstance(sp, dict):
+                k = sp.get("id") if "id" in sp else sp.get("key")
+                if k is not None:
+                    try:
+                        sold_spec_keys.add(int(k))
+                    except (TypeError, ValueError):
+                        pass
+
+    out: list[dict] = []
+    for a in areas:
+        if not isinstance(a, dict):
+            continue
+        if a.get("published") is False:
+            continue
+        spec = a.get("specification") or {}
+        spec_key = spec.get("key") if "key" in spec else spec.get("id")
+        spec_label = spec.get("label") or spec.get("name") or ""
+        occ = a.get("occupancy") or {}
+        geom = a.get("geometry") or {}
+        center = geom.get("center") or {}
+
+        area_id = str(a.get("id") or a.get("name") or "")
+        # Robust name extraction (a['label'] may be dict or missing)
+        lbl = a.get("label")
+        if isinstance(lbl, dict):
+            name = a.get("name") or lbl.get("label") or area_id
+        else:
+            name = a.get("name") or area_id
+
+        # Live status (if any)
+        status_live = statuses.get(area_id) or statuses.get(name) or ""
+
+        # is_for_sale: spec key must be in the event's currently-sold list
+        try:
+            spec_key_int = int(spec_key) if spec_key is not None else None
+        except (TypeError, ValueError):
+            spec_key_int = None
+        is_for_sale = (spec_key_int in sold_spec_keys) if sold_spec_keys else True
+
+        out.append({
+            "id": area_id,
+            "objectId": area_id,
+            "label": name,
+            "displayedLabel": name,
+            "category": str(spec_label),
+            "categoryKey": spec_key,
+            "ticketType": str(spec_label),
+            "section": name,
+            "capacity": occ.get("capacity") or 0,
+            "minOccupancy": occ.get("minOccupancy") or 1,
+            "isAvailableForSale": is_for_sale,    # ← derived from event.specs
+            "x": center.get("x"),
+            "y": center.get("y"),
+            "center": center,
+            "labels": {"section": name, "displayedLabel": name},
+            "itemType": a.get("itemType") or "generalAdmission",
+            "status_hint": status_live or ("free" if is_for_sale else "unavailable"),
+        })
+    return out
+
+
+def normalize_seats_planner_to_rendering_info(
+    event_data: dict, map_data: dict, statuses: dict[str, str]
+) -> dict:
+    """Produce a rendering_info-like dict the rest of the bot expects."""
+    objs = _norm_objects_from_areas(map_data, statuses, event_data=event_data)
+    return {
+        "objects": objs,
+        "categories": _norm_specifications(event_data, map_data),
+        "_provider": "seats_planner",
+        "_chart_key": map_data.get("key"),
+        "_event_key": event_data.get("key"),
+        "_venue_name": map_data.get("name"),
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Status normalisation
+# ════════════════════════════════════════════════════════════════════════
+def _coerce_statuses(payload: Any) -> dict[str, str]:
+    """seats_planner /event/{ek}/items returns 204 when nothing held; or a
+    dict {area_id: 'booked'/'free'} or list of {id, status}."""
+    if not payload:
+        return {}
+    if isinstance(payload, dict):
+        # direct mapping
+        if all(isinstance(v, str) for v in payload.values()):
+            return {str(k): str(v) for k, v in payload.items()}
+        # nested under .items / .objects / .statuses
+        for key in ("items", "objects", "statuses", "data"):
+            v = payload.get(key)
+            if isinstance(v, dict):
+                return {str(k): str(vv) for k, vv in v.items()}
+            if isinstance(v, list):
+                out = {}
+                for it in v:
+                    if isinstance(it, dict):
+                        kk = it.get("id") or it.get("objectId") or it.get("label")
+                        ss = it.get("status") or it.get("state") or it.get("value")
+                        if kk and ss:
+                            out[str(kk)] = str(ss)
+                return out
+    if isinstance(payload, list):
+        out = {}
+        for it in payload:
+            if isinstance(it, dict):
+                kk = it.get("id") or it.get("objectId") or it.get("label")
+                ss = it.get("status") or it.get("state") or it.get("value")
+                if kk and ss:
+                    out[str(kk)] = str(ss)
+        return out
+    return {}
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Legacy seat selection (kept for backwards compat with the booking flow)
+# ════════════════════════════════════════════════════════════════════════
+def _seat_no(v: Any) -> Optional[int]:
+    if v is None:
+        return None
+    s = str(v)
+    m = re.search(r"(\d+)", s)
+    return int(m.group(1)) if m else None
 
 
 def _deep_find_value(obj: Any, keys: set[str]) -> Any:
@@ -64,23 +396,6 @@ def _deep_find_value(obj: Any, keys: set[str]) -> Any:
     return None
 
 
-def _normalize_statuses(payload: Any) -> dict[str, str]:
-    raw = payload.get("statuses") if isinstance(payload, dict) else None
-    if isinstance(raw, dict):
-        return {str(k): str(v) for k, v in raw.items()}
-    if isinstance(raw, list):
-        out: dict[str, str] = {}
-        for item in raw:
-            if not isinstance(item, dict):
-                continue
-            key = item.get("label") or item.get("objectId") or item.get("id")
-            val = item.get("status") or item.get("value") or item.get("state")
-            if key and val:
-                out[str(key)] = str(val)
-        return out
-    return {}
-
-
 def _extract_objects(rendering_info: Any) -> list[dict[str, Any]]:
     if isinstance(rendering_info, dict):
         for key in ("objects", "items", "selectableObjects", "renderableObjects"):
@@ -93,7 +408,7 @@ def _extract_objects(rendering_info: Any) -> list[dict[str, Any]]:
                 return got
     elif isinstance(rendering_info, list):
         if rendering_info and isinstance(rendering_info[0], dict):
-            if any(("id" in x or "objectId" in x) for x in rendering_info if isinstance(x, dict)):
+            if any((("id" in x or "objectId" in x) for x in rendering_info if isinstance(x, dict))):
                 return rendering_info
         for v in rendering_info:
             got = _extract_objects(v)
@@ -102,20 +417,13 @@ def _extract_objects(rendering_info: Any) -> list[dict[str, Any]]:
     return []
 
 
-def _seat_no(v: Any) -> Optional[int]:
-    if v is None:
-        return None
-    s = str(v)
-    m = re.search(r"(\d+)", s)
-    return int(m.group(1)) if m else None
-
-
 def pick_adjacent_from_snapshot(
     rendering_info: Any,
     statuses: dict[str, str],
     quantity: int,
     target_blocks: Optional[list[str]] = None,
 ) -> list[str]:
+    """Legacy adjacent picker (still used by smoke_test + drop_watcher)."""
     target_blocks = [b.strip().lower() for b in (target_blocks or []) if b.strip()]
     objects = _extract_objects(rendering_info)
     free: list[dict[str, Any]] = []
@@ -125,8 +433,7 @@ def pick_adjacent_from_snapshot(
         labels = obj.get("labels") or {}
         label = (
             _deep_find_value(obj, {"displayedLabel", "label", "labelText"})
-            or labels.get("displayedLabel")
-            or oid
+            or labels.get("displayedLabel") or oid
         )
         status = statuses.get(str(label)) or statuses.get(str(oid)) or "free"
         if str(status).lower() not in {"free", "available", "not_booked"}:
@@ -170,21 +477,49 @@ def pick_adjacent_from_snapshot(
     return [w["id"] for w in free[:quantity]]
 
 
+# ════════════════════════════════════════════════════════════════════════
+# SeatsioClient
+# ════════════════════════════════════════════════════════════════════════
 class SeatsioClient:
-    def __init__(self, event_key: str):
+    """Unified client.
+
+    Usage:
+        async with SeatsioClient(event_key,
+                                  workspace_key=...,
+                                  chart_key=...,
+                                  provider="seats_planner",
+                                  hold_token=...) as c:
+            ri = await c.rendering_info()
+            statuses = await c.object_statuses()
+    """
+
+    def __init__(self, event_key: str, *,
+                 workspace_key: str = "",
+                 chart_key: str = "",
+                 provider: str = "",
+                 hold_token: str = ""):
         self.event_key = event_key
-        self.workspace_key = ""
-        self.session: Optional[aiohttp.ClientSession] = None
-        self.hold_token = ""
+        self.workspace_key = workspace_key or ""
+        self.chart_key = chart_key or ""
+        self.provider = (provider or "").lower()
+        self.hold_token = hold_token or ""
         self.hold_token_expires = 0.0
+        self.session: Optional[aiohttp.ClientSession] = None
         self._ws_task: Optional[asyncio.Task] = None
+        # Cached normalised payload
+        self._cached_event: dict = {}
+        self._cached_map: dict = {}
+        self._cached_ri: dict = {}
 
     async def __aenter__(self):
-        tokens = await ensure_tokens()
-        self.workspace_key = tokens.get("workspace_key") or ""
+        # Resolve workspace_key if missing — pull from the cached frontend tokens
         if not self.workspace_key:
-            raise RuntimeError("SeatCloud workspace key is not available")
-        self.session = aiohttp.ClientSession()
+            try:
+                tokens = await ensure_tokens()
+                self.workspace_key = tokens.get("workspace_key") or ""
+            except Exception:
+                pass
+        self.session = aiohttp.ClientSession(auto_decompress=True)
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
@@ -193,79 +528,174 @@ class SeatsioClient:
         if self.session:
             await self.session.close()
 
-    async def _get(self, path: str, *, qs: Optional[dict[str, str]] = None, timeout: int = 15) -> Any:
-        url = f"{SEATCLOUD_API}{path}"
-        if qs:
-            url += f"?{urlencode(qs)}"
-        async with self.session.get(url, headers=_headers(self.hold_token), timeout=aiohttp.ClientTimeout(total=timeout)) as r:
-            try:
-                return await r.json(content_type=None)
-            except Exception:
-                return {"raw": await r.text()}
+    # ── HTTP helpers ──
+    async def _get(self, url: str, *, headers: dict, timeout: int = 15) -> tuple[int, Any]:
+        try:
+            async with self.session.get(
+                url, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=timeout),
+            ) as r:
+                d = await _read_json(r)
+                return r.status, d
+        except Exception as e:
+            log.debug(f"GET {url[:120]} → {e}")
+            return 0, {"error": str(e)[:200]}
 
-    async def _post(self, path: str, body: dict[str, Any], timeout: int = 15) -> Any:
-        url = f"{SEATCLOUD_API}{path}"
-        async with self.session.post(url, headers=_headers(self.hold_token), json=body, timeout=aiohttp.ClientTimeout(total=timeout)) as r:
-            try:
-                return await r.json(content_type=None)
-            except Exception:
-                return {"raw": await r.text(), "status": r.status}
+    async def _post(self, url: str, *, headers: dict, body: dict,
+                    timeout: int = 15) -> tuple[int, Any]:
+        try:
+            async with self.session.post(
+                url, headers=headers, json=body,
+                timeout=aiohttp.ClientTimeout(total=timeout),
+            ) as r:
+                d = await _read_json(r)
+                return r.status, d
+        except Exception as e:
+            log.debug(f"POST {url[:120]} → {e}")
+            return 0, {"error": str(e)[:200]}
 
-    async def rendering_info(self) -> Any:
-        return await self._get(
-            f"/system/public/{self.workspace_key}/rendering-info",
-            qs={"event_key": self.event_key},
-            timeout=20,
-        )
+    # ── Modern API (seats_planner) ──
+    async def fetch_event(self) -> dict:
+        if not self.workspace_key:
+            return {}
+        url = (f"{SEATCLOUD_API}/api/v2/{self.workspace_key}/event/"
+               f"{self.event_key}?trace_id={_trace_id()}&plain=true")
+        st, d = await self._get(url, headers=_chart_headers(self.hold_token))
+        if st == 200 and isinstance(d, dict):
+            self._cached_event = d
+            return d
+        return {}
+
+    async def fetch_map(self) -> dict:
+        if not self.workspace_key or not self.chart_key:
+            return {}
+        url = (f"{SEATCLOUD_API}/api/v2/{self.workspace_key}/map/"
+               f"{self.chart_key}/data?trace_id={_trace_id()}&plain=true")
+        st, d = await self._get(url, headers=_chart_headers(self.hold_token), timeout=20)
+        if st == 200 and isinstance(d, dict):
+            self._cached_map = d
+            return d
+        return {}
+
+    async def fetch_item_statuses(self) -> dict[str, str]:
+        if not self.workspace_key:
+            return {}
+        url = (f"{SEATCLOUD_API}/api/v2/{self.workspace_key}/event/"
+               f"{self.event_key}/items?trace_id={_trace_id()}&plain=true")
+        if self.hold_token:
+            url += f"&hold_token={self.hold_token}"
+        st, d = await self._get(url, headers=_chart_headers(self.hold_token))
+        # 204 = empty, no items held → all free
+        if st in (200, 204):
+            return _coerce_statuses(d)
+        return {}
+
+    # ── Public API used by the rest of the bot (rendering_info shape) ──
+    async def rendering_info(self) -> dict:
+        """Returns rendering_info-like dict (objects[], categories[]).
+
+        For seats_planner: synthesises from /event + /map.
+        For legacy seatsio: tries the old /system/public path (kept best-effort).
+        Returns {} on hard failure (the caller should NOT interpret an empty
+        dict as 'chart full' — it means the API was unreachable).
+        """
+        # Modern path first (works for seats_planner AND many legacy events)
+        if self.workspace_key and self.chart_key:
+            ev = await self.fetch_event()
+            mp = await self.fetch_map()
+            if ev and mp:
+                statuses = await self.fetch_item_statuses()
+                ri = normalize_seats_planner_to_rendering_info(ev, mp, statuses)
+                self._cached_ri = ri
+                return ri
+            # If we reached here, the v2 endpoint failed — fall through to legacy
+            log.debug(f"v2 path failed for {self.event_key} (ev={bool(ev)} mp={bool(mp)})")
+
+        # Legacy path — only attempt with workspace_key
+        if not self.workspace_key:
+            return {}
+        url = (f"{SEATSIO_LEGACY_API}/system/public/{self.workspace_key}/"
+               f"rendering-info?event_key={self.event_key}")
+        st, d = await self._get(url, headers=_legacy_headers(self.hold_token))
+        if st == 200 and isinstance(d, dict) and "raw" not in d:
+            self._cached_ri = d
+            return d
+        return {}
 
     async def object_statuses(self) -> dict[str, str]:
-        payload = await self._get(
-            f"/system/public/{self.workspace_key}/events/object-statuses",
-            qs={"event_key": self.event_key},
-            timeout=10,
-        )
-        return _normalize_statuses(payload if isinstance(payload, dict) else {})
+        """Unified status getter — modern first, legacy fallback."""
+        if self.workspace_key and self.chart_key:
+            sts = await self.fetch_item_statuses()
+            if sts is not None:
+                return sts
+        # Legacy
+        if self.workspace_key:
+            url = (f"{SEATSIO_LEGACY_API}/system/public/{self.workspace_key}/"
+                   f"events/object-statuses?event_key={self.event_key}")
+            st, d = await self._get(url, headers=_legacy_headers(self.hold_token))
+            if st == 200:
+                return _coerce_statuses(d if isinstance(d, dict) else {})
+        return {}
 
+    # ── Hold-token + book + release ──
     async def init_hold_token(self) -> str:
-        payload = await self._post(
-            f"/system/public/{self.workspace_key}/hold-tokens",
-            {},
-            timeout=10,
-        )
+        """Init via legacy POST /hold-tokens (used when webook didn't issue one)."""
+        if self.hold_token:
+            return self.hold_token
+        if not self.workspace_key:
+            raise RuntimeError("workspace_key not set")
+        # Modern team-scoped endpoint
+        url = (f"{SEATCLOUD_API}/api/v1/team/{self.workspace_key}/"
+               f"hold-tokens/public/generate?trace_id={_trace_id()}")
+        st, d = await self._post(url, headers=_chart_headers(), body={})
         token = ""
-        if isinstance(payload, dict):
-            token = payload.get("holdToken") or payload.get("hold_token") or payload.get("token") or ""
+        if isinstance(d, dict):
+            token = (d.get("data") or {}).get("token") or d.get("token") or d.get("holdToken") or ""
         if not token:
-            raise RuntimeError(f"SeatCloud hold-token init failed: {payload}")
+            # Legacy fallback
+            url2 = f"{SEATSIO_LEGACY_API}/system/public/{self.workspace_key}/hold-tokens"
+            st, d = await self._post(url2, headers=_legacy_headers(), body={})
+            if isinstance(d, dict):
+                token = d.get("holdToken") or d.get("token") or ""
+        if not token:
+            raise RuntimeError(f"could not obtain hold-token: status={st}")
         self.hold_token = token
-        self.hold_token_expires = time.time() + float((payload or {}).get("expiresInSeconds") or 900)
+        self.hold_token_expires = time.time() + 900
         return token
 
     async def hold_objects(self, object_ids: list[str], ticket_type: str = "") -> Any:
+        """Best-effort hold via the legacy adapter — most webook charts still
+        accept this path. For seats_planner the actual booking goes through
+        webook's /add-to-cart with selected_seats, so this is only used as a
+        defensive pre-hold step."""
         if not self.hold_token:
             await self.init_hold_token()
+        if not self.workspace_key:
+            return {"errors": ["no workspace_key"]}
         body = {
             "holdToken": self.hold_token,
             "objects": [
-                ({"objectId": oid, "ticketType": ticket_type} if ticket_type else {"objectId": oid})
+                ({"objectId": oid, "ticketType": ticket_type} if ticket_type
+                 else {"objectId": oid})
                 for oid in object_ids
             ],
         }
-        return await self._post(
-            f"/adapter/sio/system/public/{self.workspace_key}/events/{self.event_key}/actions/hold",
-            body,
-            timeout=15,
-        )
+        url = (f"{SEATSIO_LEGACY_API}/adapter/sio/system/public/"
+               f"{self.workspace_key}/events/{self.event_key}/actions/hold")
+        st, d = await self._post(url, headers=_legacy_headers(self.hold_token), body=body)
+        return d if isinstance(d, dict) else {"raw": d, "status": st}
 
     async def release_objects(self, object_ids: list[str]) -> Any:
-        if not self.hold_token:
+        if not self.hold_token or not self.workspace_key:
             return {}
-        body = {"holdToken": self.hold_token, "objects": [{"objectId": oid} for oid in object_ids]}
-        return await self._post(
-            f"/adapter/sio/system/public/{self.workspace_key}/events/{self.event_key}/actions/release",
-            body,
-            timeout=10,
-        )
+        body = {
+            "holdToken": self.hold_token,
+            "objects": [{"objectId": oid} for oid in object_ids],
+        }
+        url = (f"{SEATSIO_LEGACY_API}/adapter/sio/system/public/"
+               f"{self.workspace_key}/events/{self.event_key}/actions/release")
+        st, d = await self._post(url, headers=_legacy_headers(self.hold_token), body=body)
+        return d if isinstance(d, dict) else {"raw": d, "status": st}
 
     async def pick_and_hold_adjacent(
         self,
@@ -276,21 +706,33 @@ class SeatsioClient:
         rendering_info: Any = None,
         statuses: Optional[dict[str, str]] = None,
     ) -> tuple[list[str], dict[str, Any]]:
+        """Backwards-compat helper used by drop_watcher."""
         rendering = rendering_info if rendering_info is not None else await self.rendering_info()
         sts = statuses if statuses is not None else await self.object_statuses()
-        object_ids = pick_adjacent_from_snapshot(rendering, sts, quantity, target_blocks=target_blocks)
+        object_ids = pick_adjacent_from_snapshot(
+            rendering, sts, quantity, target_blocks=target_blocks,
+        )
         if not object_ids:
             return [], {"rendering_info": rendering, "statuses": sts}
-        await self.init_hold_token()
-        hold_result = await self.hold_objects(object_ids, ticket_type=ticket_type)
-        errors = hold_result.get("errors") if isinstance(hold_result, dict) else None
-        if errors:
-            raise RuntimeError(f"SeatCloud hold failed: {errors}")
-        return object_ids, {"rendering_info": rendering, "statuses": sts, "hold": hold_result}
-
-    async def watch_changes(self, on_change):
-        if not self.hold_token:
+        try:
             await self.init_hold_token()
+            await self.hold_objects(object_ids, ticket_type=ticket_type)
+        except Exception as e:
+            log.debug(f"pick_and_hold soft-fail: {e}")
+        return object_ids, {"rendering_info": rendering, "statuses": sts}
+
+    # ── WebSocket (drop watcher) ──
+    async def watch_changes(self, on_change):
+        """Subscribe to seat-status changes. seats_planner uses a different
+        WS shape; we implement the legacy one here. drop_watcher will fall
+        back to polling if WS is unsupported."""
+        if not self.workspace_key:
+            return
+        if not self.hold_token:
+            try:
+                await self.init_hold_token()
+            except Exception:
+                return
         ws_url = (
             f"wss://api.seatcloud.com/system/public/{self.workspace_key}/events/"
             f"{self.event_key}/changes/socket?holdToken={self.hold_token}"

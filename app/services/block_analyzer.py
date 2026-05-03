@@ -63,23 +63,99 @@ def _is_free(status: str) -> bool:
 # ════════════════════════════════════════════════════════════════════════
 def extract_blocks(rendering_info: Any,
                    statuses: dict[str, str] | None = None) -> list[dict]:
-    """Aggregate every seat by its containing block/section.
+    """Aggregate seats/areas into blocks.
 
-    Returns a list of dicts:
-        {
-            "name":     "S1",
-            "center_x": 500.0,
-            "center_y": 320.5,
-            "free":     12,
-            "total":    50,
-            "category": "CAT 1 - S",   # most common category in the block
-        }
+    Supports TWO chart shapes:
+      1. Legacy seats.io — one object per seat. We aggregate by section.
+      2. seats_planner   — one object per area (block) with capacity.
+         Detected via `obj['itemType'] == 'generalAdmission'` or presence
+         of `obj['capacity']` field.
+
+    Returns:
+        [
+          {"name": "S1", "center_x": 500.0, "center_y": 320.5,
+           "free": 12, "total": 50, "category": "CAT 1 - S",
+           "category_key": 9, "item_type": "generalAdmission",
+           "id": "21"},
+          ...
+        ]
     """
     statuses = statuses or {}
     objs = _walk_objects(rendering_info)
     if not objs:
         return []
 
+    # Detect 'area-based' charts (seats_planner) — each object IS a block
+    is_area_based = any(
+        isinstance(o, dict) and (
+            o.get("itemType") == "generalAdmission"
+            or "capacity" in o
+        )
+        for o in objs
+    )
+
+    if is_area_based:
+        out: list[dict] = []
+        for obj in objs:
+            if not isinstance(obj, dict):
+                continue
+            name = (obj.get("label") or obj.get("displayedLabel")
+                    or obj.get("section") or obj.get("name") or "").strip()
+            if not name:
+                continue
+            oid = str(obj.get("id") or obj.get("objectId") or name)
+            category = (obj.get("category") or obj.get("ticketType") or "").strip()
+            cat_key = obj.get("categoryKey")
+            capacity = int(obj.get("capacity") or 0)
+            avail = obj.get("isAvailableForSale")
+            status = statuses.get(oid) or statuses.get(name) or ""
+
+            # Determine free/total:
+            #   - capacity == 0 → unknown (chart designer didn't set it)
+            #   - availableForSale=False AND no live status → block hidden/sold-out
+            #   - availableForSale=True → assume `capacity` seats free until
+            #     /items endpoint says otherwise
+            total = capacity if capacity > 0 else -1
+            if status:
+                # status takes priority when present
+                free = total if _is_free(status) else 0
+            elif avail is True:
+                free = total
+            elif avail is False:
+                free = 0
+            else:
+                free = -1   # unknown
+
+            x = obj.get("x") or obj.get("cx")
+            y = obj.get("y") or obj.get("cy")
+            if (x is None or y is None) and obj.get("center"):
+                c = obj["center"]
+                x = x if x is not None else c.get("x")
+                y = y if y is not None else c.get("y")
+
+            try:
+                cx = float(x) if x is not None else 0.0
+                cy = float(y) if y is not None else 0.0
+            except (TypeError, ValueError):
+                cx, cy = 0.0, 0.0
+
+            out.append({
+                "name": name,
+                "id": oid,
+                "center_x": cx,
+                "center_y": cy,
+                "free": free,
+                "total": total,
+                "category": category,
+                "category_key": cat_key,
+                "item_type": obj.get("itemType") or "generalAdmission",
+                "min_occupancy": int(obj.get("minOccupancy") or 1),
+                "is_available_for_sale": avail,
+            })
+        out.sort(key=lambda d: (_to_int(d["name"]) or 0, d["name"]))
+        return out
+
+    # Legacy: per-seat objects → aggregate by section
     by_block: dict[str, dict[str, Any]] = {}
     for obj in objs:
         if not isinstance(obj, dict):
@@ -96,7 +172,6 @@ def extract_blocks(rendering_info: Any,
         category = (obj.get("category") or obj.get("categoryKey")
                     or obj.get("ticketType") or "").strip()
 
-        # Coordinates may live in different keys depending on chart version
         x = obj.get("x") or obj.get("cx")
         y = obj.get("y") or obj.get("cy")
         if (x is None or y is None) and "center" in obj:
@@ -128,43 +203,62 @@ def extract_blocks(rendering_info: Any,
         if category:
             b["_cats"][category] = b["_cats"].get(category, 0) + 1
 
-    out: list[dict] = []
+    out2: list[dict] = []
     for name, b in by_block.items():
         cx = sum(b["_xs"]) / len(b["_xs"]) if b["_xs"] else 0.0
         cy = sum(b["_ys"]) / len(b["_ys"]) if b["_ys"] else 0.0
         cat = ""
         if b["_cats"]:
             cat = max(b["_cats"].items(), key=lambda kv: kv[1])[0]
-        out.append({
+        out2.append({
             "name": name,
+            "id": name,
             "center_x": cx,
             "center_y": cy,
             "free": b["free"],
             "total": b["total"],
             "category": cat,
+            "category_key": None,
+            "item_type": "seat",
         })
-    # Stable sort: by name (alphanumeric-aware)
-    out.sort(key=lambda d: (_to_int(d["name"]) or 0, d["name"]))
-    return out
+    out2.sort(key=lambda d: (_to_int(d["name"]) or 0, d["name"]))
+    return out2
 
 
 def geometric_neighbors(blocks: list[dict], reference: str,
                         exclude: list[str] | None = None,
-                        limit: int = 8) -> list[str]:
-    """Return block names ordered by Euclidean distance from `reference`."""
+                        limit: int = 8,
+                        same_category_only: bool = False) -> list[str]:
+    """Return block names ordered by Euclidean distance from `reference`.
+
+    A block is considered a candidate when free > 0 OR free == -1 (unknown).
+    `same_category_only`: when True, only return neighbors that share the
+    reference block's category (useful so we don't suggest VIP when the
+    user picked a Silver block).
+    """
     exclude = set(exclude or [])
     exclude.add(reference)
     ref = next((b for b in blocks if b["name"] == reference), None)
     if not ref:
         return []
     rx, ry = ref["center_x"], ref["center_y"]
-    candidates = [
-        (b["name"],
-         math.hypot(b["center_x"] - rx, b["center_y"] - ry),
-         b["free"])
-        for b in blocks if b["name"] not in exclude and b["free"] > 0
-    ]
-    candidates.sort(key=lambda t: (t[1], -t[2]))  # closest first, free desc tiebreak
+    ref_cat = (ref.get("category") or "").strip()
+    candidates = []
+    for b in blocks:
+        if b["name"] in exclude:
+            continue
+        free = b.get("free", 0)
+        if free == 0:        # known empty
+            continue
+        if same_category_only and ref_cat:
+            if (b.get("category") or "").strip() != ref_cat:
+                continue
+        candidates.append((
+            b["name"],
+            math.hypot(b["center_x"] - rx, b["center_y"] - ry),
+            free if free >= 0 else 1,    # treat unknown as 1
+        ))
+    candidates.sort(key=lambda t: (t[1], -t[2]))
     return [c[0] for c in candidates[:limit]]
 
 
@@ -174,12 +268,50 @@ def adjacent_seats_in_block(rendering_info: Any,
                              quantity: int) -> list[str]:
     """Find `quantity` consecutive free seats within `block_name`.
 
+    For seats_planner area-based charts (generalAdmission), there are no
+    individual seat objects — instead each block has a `capacity`. In
+    that case we return [block_id] * quantity (the booking will pass the
+    block id as `selected_seats` and webook expands it server-side).
+
     Returns the seat IDs in row-order, or [] if not possible.
     """
     objs = _walk_objects(rendering_info)
     if not objs:
         return []
 
+    # ── seats_planner path: each object IS a block (area) ──
+    target_obj = None
+    for obj in objs:
+        if not isinstance(obj, dict):
+            continue
+        name = (obj.get("label") or obj.get("displayedLabel")
+                or obj.get("section") or obj.get("name") or "").strip()
+        if name == block_name and (
+            obj.get("itemType") == "generalAdmission"
+            or "capacity" in obj
+        ):
+            target_obj = obj
+            break
+
+    if target_obj is not None:
+        # Block is unavailable for sale → cannot pick from it
+        avail = target_obj.get("isAvailableForSale")
+        if avail is False:
+            return []
+        oid = str(target_obj.get("id") or target_obj.get("objectId")
+                  or block_name)
+        capacity = int(target_obj.get("capacity") or 0)
+        if capacity > 0 and quantity > capacity:
+            return []
+        # Status check (live data overrides defaults if present)
+        status = statuses.get(oid) or statuses.get(block_name) or ""
+        if status and not _is_free(status):
+            return []
+        # For generalAdmission we book by block-id, repeated `quantity` times.
+        # The actual seats are picked by the venue server.
+        return [oid] * quantity
+
+    # ── legacy seats.io path: per-seat objects ──
     free_in_block: list[dict] = []
     for obj in objs:
         if not isinstance(obj, dict):
@@ -206,7 +338,6 @@ def adjacent_seats_in_block(rendering_info: Any,
     if len(free_in_block) < quantity:
         return []
 
-    # group by row, then look for contiguous run
     by_row: dict[str, list[dict]] = {}
     for s in free_in_block:
         by_row.setdefault(s["row"], []).append(s)
@@ -222,7 +353,6 @@ def adjacent_seats_in_block(rendering_info: Any,
                all(nums[j] == nums[j - 1] + 1 for j in range(1, len(nums))):
                 return [w["id"] for w in window]
 
-    # Fallback: return any N free seats from the block (best-effort)
     return [s["id"] for s in free_in_block[:quantity]]
 
 
@@ -259,22 +389,22 @@ def find_seats_with_fallback(rendering_info: Any,
     """High-level finder used by the booking engine.
 
     Returns (seat_ids, block_used). If nothing is found anywhere, returns
-    ([], "") and the caller should engage the drop-watcher.
+    ([], "") and the caller should distinguish between two cases:
+      - chart fully sold out      → engage drop-watcher
+      - chart unreachable / empty → transient error, retry/fallback
 
     Order:
       1. primary_block
       2. backup_blocks (in user order)
-      3. geometric neighbors of (primary, then each backup) — only if
+      3. geometric neighbors (same category preferred) — only if
          expand_geometric=True
     """
-    # 1) primary
     if primary_block:
         ids = adjacent_seats_in_block(rendering_info, statuses,
                                        primary_block, quantity)
         if ids:
             return ids, primary_block
 
-    # 2) backups
     for blk in backup_blocks:
         ids = adjacent_seats_in_block(rendering_info, statuses,
                                        blk, quantity)
@@ -284,19 +414,38 @@ def find_seats_with_fallback(rendering_info: Any,
     if not expand_geometric:
         return [], ""
 
-    # 3) geometric neighbors
     blocks = extract_blocks(rendering_info, statuses)
     seen = set([primary_block] + list(backup_blocks))
     refs = [primary_block] + list(backup_blocks)
-    for ref in refs:
-        if not ref:
-            continue
-        for nb in geometric_neighbors(blocks, ref, exclude=list(seen),
-                                       limit=expand_limit):
-            ids = adjacent_seats_in_block(rendering_info, statuses,
-                                           nb, quantity)
-            if ids:
-                return ids, nb
-            seen.add(nb)
+    # Prefer same-category neighbors first, then any
+    for same_cat_pref in (True, False):
+        for ref in refs:
+            if not ref:
+                continue
+            for nb in geometric_neighbors(
+                blocks, ref, exclude=list(seen),
+                limit=expand_limit, same_category_only=same_cat_pref,
+            ):
+                ids = adjacent_seats_in_block(rendering_info, statuses,
+                                               nb, quantity)
+                if ids:
+                    return ids, nb
+                seen.add(nb)
 
     return [], ""
+
+
+def chart_is_sold_out(rendering_info: Any,
+                      statuses: dict[str, str] | None = None) -> bool:
+    """True ONLY when we have real chart data AND every block reports zero
+    free capacity. Returns False if data is missing/unknown — callers must
+    treat that as a transient error, not as 'chart full'."""
+    statuses = statuses or {}
+    blocks = extract_blocks(rendering_info, statuses)
+    if not blocks:
+        return False  # no chart data → cannot conclude full
+    for b in blocks:
+        free = b.get("free", 0)
+        if free > 0 or free < 0:    # >0 free, or unknown (-1)
+            return False
+    return True

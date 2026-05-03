@@ -86,8 +86,10 @@ async def book_one(
         backup_blocks=backup_blocks,
     )
 
-    # Chart fully booked → register a drop watcher and return early
-    if not res.get("ok") and res.get("no_seats_anywhere"):
+    # ── Chart genuinely sold out → register drop watcher ──
+    # ONLY when seats.io confirmed every block is full. Transient errors
+    # (chart_unreachable, turnstile_required) MUST NOT trigger this path.
+    if not res.get("ok") and res.get("chart_full"):
         seat_info = res.get("seat_info") or {}
         event_key = seat_info.get("event_key", "")
         if event_key:
@@ -111,6 +113,37 @@ async def book_one(
             "label": label,
             "error": "الخريطة ممتلئة — فُعّل وضع الترقّب لاصطياد المقاعد الساقطة.",
             "drop_watcher_active": True,
+        }
+
+    # ── Turnstile required → transient, return clear error ──
+    if not res.get("ok") and res.get("turnstile_required"):
+        return {
+            "ok": False,
+            "account_id": assignment.account_id,
+            "label": label,
+            "error": (res.get("error")
+                       or "الفعالية تتطلب Turnstile — أكمل التحقّق من المتصفح ثم أعد المحاولة."),
+            "turnstile_required": True,
+        }
+
+    # ── Queue active → transient, return clear error ──
+    if not res.get("ok") and res.get("queued"):
+        return {
+            "ok": False,
+            "account_id": assignment.account_id,
+            "label": label,
+            "error": (res.get("error") or "الفعالية في طابور الانتظار — أعد المحاولة لاحقاً."),
+            "queued": True,
+        }
+
+    # ── Chart unreachable (network error) → transient ──
+    if not res.get("ok") and res.get("chart_unreachable"):
+        return {
+            "ok": False,
+            "account_id": assignment.account_id,
+            "label": label,
+            "error": (res.get("error") or "تعذّر الوصول لخريطة المقاعد — أعد المحاولة."),
+            "chart_unreachable": True,
         }
 
     if not res.get("ok"):
