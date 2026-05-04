@@ -39,7 +39,7 @@ SENSITIVE = {
     "TELEGRAM_BOT_TOKEN", "WEBOOK_PUBLIC_TOKEN",
     "ADMIN_PASSWORD", "DATABASE_URL", "TURSO_AUTH_TOKEN",
     "ADMIN_SESSION_SECRET", "password", "access_token",
-    "refresh_token",
+    "refresh_token", "CAPTCHA_API_KEY",
 }
 
 KNOWN_SETTINGS = [
@@ -48,6 +48,10 @@ KNOWN_SETTINGS = [
     ("AUTHORIZED_CHAT_IDS", "معرفات إضافية مسموح لها (فواصل)"),
     ("WEBOOK_PUBLIC_TOKEN", "توكن webook العام (محدد افتراضياً)"),
     ("ADMIN_PASSWORD", "كلمة مرور لوحة الإدارة"),
+    ("CAPTCHA_API_KEY", "مفتاح 2Captcha لحل Turnstile + reCAPTCHA تلقائيًا"),
+    ("WEBOOK_TURNSTILE_SITEKEY", "Cloudflare Turnstile sitekey لصفحات webook (له قيمة افتراضية)"),
+    ("TURNSTILE_SOLVER_ENABLED", "تفعيل حل Turnstile تلقائيًا عبر 2Captcha (true/false)"),
+    ("TURNSTILE_SOLVER_TIMEOUT", "ثواني الانتظار لحل Turnstile (افتراضي 180)"),
 ]
 
 

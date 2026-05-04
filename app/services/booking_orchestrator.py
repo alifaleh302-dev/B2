@@ -84,7 +84,46 @@ async def book_one(
         ticket_meta=ticket_meta,
         primary_block=primary_block,
         backup_blocks=backup_blocks,
+        auto_solve_turnstile=True,
     )
+
+    # ── Turnstile-still-required after auto-solve → retry once via 2Captcha ──
+    # `book_ticket_http` already attempts 2Captcha internally on the first
+    # request. If it still surfaces `turnstile_required` we try one more
+    # explicit pass here (fresh token, single-use) before falling back to
+    # the Playwright browser.
+    if not res.get("ok") and res.get("turnstile_required"):
+        await _p(f"🧩 <code>{label}</code> — الحدث محمي بـ Turnstile — جارٍ حل التحدي…")
+        try:
+            from app.services.turnstile_solver import (
+                solve_turnstile, webook_book_page,
+            )
+            from app.core.config import turnstile_solver_timeout
+            sol = await solve_turnstile(
+                page_url=webook_book_page(event_slug),
+                timeout=turnstile_solver_timeout(),
+            )
+            if sol.get("ok") and sol.get("token"):
+                await _p(f"✅ <code>{label}</code> — تم حل Turnstile — إعادة محاولة الحجز")
+                res = await book_ticket_http(
+                    bearer=bearer,
+                    slug=event_slug,
+                    ticket_id=ticket_id,
+                    quantity=assignment.quantity,
+                    payment_method=payment_method,
+                    ticket_meta=ticket_meta,
+                    primary_block=primary_block,
+                    backup_blocks=backup_blocks,
+                    turnstile_token=sol["token"],
+                    auto_solve_turnstile=False,  # already solved
+                )
+            else:
+                log.warning(
+                    f"explicit 2Captcha solve failed for {label}: "
+                    f"{(sol.get('error') or 'unknown')[:120]}"
+                )
+        except Exception as e:
+            log.exception(f"turnstile retry crashed: {e}")
 
     # ── Chart genuinely sold out → register drop watcher ──
     # ONLY when seats.io confirmed every block is full. Transient errors
@@ -115,16 +154,18 @@ async def book_one(
             "drop_watcher_active": True,
         }
 
-    # ── Turnstile required → transient, return clear error ──
+    # ── Turnstile required even after auto-solve + explicit retry ──
+    # We do NOT return early anymore — we let the flow drop into the
+    # Playwright browser fallback below so a real browser context can
+    # carry the cf_clearance cookie naturally.
     if not res.get("ok") and res.get("turnstile_required"):
-        return {
-            "ok": False,
-            "account_id": assignment.account_id,
-            "label": label,
-            "error": (res.get("error")
-                       or "الفعالية تتطلب Turnstile — أكمل التحقّق من المتصفح ثم أعد المحاولة."),
-            "turnstile_required": True,
-        }
+        await _p(
+            f"🔁 <code>{label}</code> — تعذّر حل Turnstile تلقائيًا — التحوّل للمتصفح (Fallback)"
+        )
+        # Mark the error so the generic !ok branch below picks it up
+        # and switches to book_via_browser instead of bailing out.
+        if not res.get("error"):
+            res["error"] = "Turnstile لم يفلح عبر HTTP — جارٍ التحوّل للمتصفح"
 
     # ── Queue active → transient, return clear error ──
     if not res.get("ok") and res.get("queued"):

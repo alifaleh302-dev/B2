@@ -358,9 +358,11 @@ async def _start_block_picker(chat_id: str, msg_id: int,
       2. If that fails (e.g. seats_planner provider behind Turnstile),
          derive blocks from the ticket categories returned by webook.
          Each ticket-type IS effectively a block on these new charts.
-      3. Offer a 🌐 WebApp Mini Picker so the user can pick exact seats
-         visually inside Telegram (uses the user's browser → bypasses
-         Turnstile naturally).
+      3. Offer a 🌐 WebApp Mini Picker for VISUAL block/seat selection
+         only. The actual Cloudflare Turnstile challenge is solved
+         server-side via 2Captcha (with Playwright fallback) once the
+         user confirms their selection — the Mini App itself does NOT
+         carry any cf_clearance because it lives on a different origin.
     """
     await notifier.edit(
         chat_id, msg_id,
@@ -476,7 +478,7 @@ async def _start_block_picker(chat_id: str, msg_id: int,
         f"🗺️ <b>اختر البلوكات</b>\n\n"
         f"📦 إجمالي البلوكات: <b>{len(blocks_meta)}</b>\n"
         f"{free_line}\n"
-        + ("⚠️ <i>الفعالية محمية بـ Turnstile — يستحسن استخدام «الواجهة المرئية» أدناه لاختيار مقاعد مرئية.</i>\n" if fallback_used else "")
+        + ("⚠️ <i>الفعالية محمية بـ Cloudflare Turnstile. الحل تلقائي عبر 2Captcha — اختر البلوكات فقط وسيتولّى البوت الباقي.</i>\n" if fallback_used else "")
         + f"\n1️⃣ اضغط على بلوك ليصبح <b>الرئيسي ⭐</b>\n"
         f"2️⃣ بدّل لـ «وضع الاحتياطي» وأضف S2, S3...\n"
         f"3️⃣ اضغط <b>تأكيد البلوكات</b> للمتابعة\n"

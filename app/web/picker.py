@@ -348,12 +348,13 @@ def _picker_page_html(session_token: str, sess: dict) -> str:
 <style>{_BASE_CSS}</style>
 </head><body>
 <div class="topbar">
-  <h1>🗺️ اختيار البلوكات المرئي</h1>
+  <h1>🗺️ اختيار البلوكات / المقاعد المرئي</h1>
   <div class="sub">{html.escape(slug)[:100]}</div>
 </div>
 <div class="legend">
-  اضغط على أي بلوك لتحديده. أول اختيار يصبح <b>الرئيسي</b>، والبقية تصبح <span style="color:#38bdf8">احتياطية</span>.
-  إن كانت الخريطة غير دقيقة في هذه الفعالية، استخدم القائمة النصية أسفلها.
+  دور هذه الواجهة <b>اختيار بصري فقط</b> للبلوكات والمقاعد. اضغط على أي بلوك لتحديده.
+  أول اختيار يصبح <b>الرئيسي ⭐</b>، والبقية تصبح <span style="color:#38bdf8">احتياطية</span>.
+  بعد التأكيد سيتولّى البوت <b>تجاوز Cloudflare Turnstile</b> وإكمال الحجز في الخلفية تلقائيًا.
 </div>
 <div id="chart-wrap">
   <div id="status">🔄 جارٍ تحميل الخريطة…</div>

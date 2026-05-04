@@ -22,6 +22,8 @@ from app.core.config import (
     seatsio_enabled,
     target_blocks,
     default_payment_method,
+    turnstile_solver_enabled,
+    turnstile_solver_timeout,
 )
 from app.services.seatsio_client import (
     SeatsioClient, get_hold_token_from_webook,
@@ -30,6 +32,7 @@ from app.services.seatsio_runtime import ensure_event_warm, get_snapshot
 from app.services.block_analyzer import (
     extract_blocks, find_seats_with_fallback, chart_is_sold_out,
 )
+from app.services.turnstile_solver import solve_turnstile, webook_book_page
 
 log = logging.getLogger("booking_http")
 
@@ -328,6 +331,8 @@ async def _reserve_seated_inventory(
     primary_block: str = "",
     backup_blocks: Optional[list[str]] = None,
     turnstile_token: str = "",
+    session: Optional[aiohttp.ClientSession] = None,
+    auto_solve_turnstile: bool = True,
 ) -> tuple[Optional[dict[str, Any]], list[str], dict[str, Any]]:
     """Reserve seats via the Hydra engine.
 
@@ -371,15 +376,44 @@ async def _reserve_seated_inventory(
     legacy_targets = target_blocks()
 
     # ── Step 1: get a hold-token from webook (preferred for seats_planner) ──
+    # Reuse the caller's aiohttp session so any cf_clearance / cookies set
+    # alongside a Turnstile-bearing request stay attached for downstream
+    # add-to-cart and checkout calls.
     webook_hold_token = ""
     if event_id:
         ht, ht_meta = await get_hold_token_from_webook(
             slug=slug, event_id=event_id, bearer=bearer,
             turnstile=turnstile_token,
+            session=session,
         )
-        if ht_meta.get("turnstile_required"):
+
+        # ── Auto-solve Turnstile if Webook rejected our first attempt ──
+        if (not ht) and ht_meta.get("turnstile_required") \
+                and auto_solve_turnstile and turnstile_solver_enabled() \
+                and not turnstile_token:
+            logs.append("🧩 webook requires Turnstile — solving via 2Captcha…")
+            sol = await solve_turnstile(
+                page_url=webook_book_page(slug),
+                timeout=turnstile_solver_timeout(),
+                session=session,
+            )
+            if sol.get("ok") and sol.get("token"):
+                meta["turnstile_solved"] = True
+                logs.append(f"✅ Turnstile token acquired (…{sol['token'][-8:]})")
+                # Retry hold-token with the freshly-solved token in the
+                # SAME session so downstream cookies are preserved.
+                ht, ht_meta = await get_hold_token_from_webook(
+                    slug=slug, event_id=event_id, bearer=bearer,
+                    turnstile=sol["token"],
+                    session=session,
+                )
+                turnstile_token = sol["token"]
+            else:
+                logs.append(f"❌ 2Captcha فشل: {(sol.get('error') or 'unknown')[:120]}")
+
+        if ht_meta.get("turnstile_required") and not ht:
             meta["turnstile_required"] = True
-            logs.append("⚠️ webook hold-token requires Turnstile")
+            logs.append("⚠️ webook hold-token still requires Turnstile after retry")
         if ht_meta.get("queued"):
             meta["queued"] = True
             meta["queue_position"] = ht_meta.get("waiting_number")
@@ -490,13 +524,24 @@ async def book_ticket_http(
     backup_blocks: Optional[list[str]] = None,
     preheld_seats: Optional[list[str]] = None,
     preheld_token: str = "",
+    turnstile_token: str = "",
+    auto_solve_turnstile: bool = True,
 ) -> dict[str, Any]:
     """Main HTTP booking entry point.
 
-    New parameters:
+    Parameters:
       • primary_block, backup_blocks  → user's seat-picker preferences
       • preheld_seats, preheld_token  → if drop_watcher already held seats,
                                          skip the discovery + hold step
+      • turnstile_token               → optional pre-solved Cloudflare
+                                         Turnstile token (e.g. supplied by
+                                         a previous attempt or by the
+                                         orchestrator after a 2Captcha solve)
+      • auto_solve_turnstile          → when True (default) and Webook
+                                         rejects the hold-token request
+                                         with `turnstile_required`, the
+                                         booking pipeline transparently
+                                         calls 2Captcha and retries.
     """
     payment_method = payment_method or default_payment_method()
     backup_blocks = backup_blocks or []
@@ -576,6 +621,9 @@ async def book_ticket_http(
                     event_id=event_id,
                     primary_block=primary_block,
                     backup_blocks=backup_blocks,
+                    turnstile_token=turnstile_token,
+                    session=session,
+                    auto_solve_turnstile=auto_solve_turnstile,
                 )
                 result["logs"].extend(seat_logs)
                 rendering_info_for_summary = seat_meta.get("rendering_info")

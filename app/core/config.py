@@ -177,6 +177,30 @@ def two_captcha_api_key() -> str:
     return _env_or("CAPTCHA_API_KEY", "")
 
 
+def webook_turnstile_sitekey() -> str:
+    """Cloudflare Turnstile sitekey used by webook.com book pages.
+
+    Default value is the public sitekey currently used by webook.com
+    (extracted from the live frontend bundle). Operators can override
+    this via the /admin UI by setting ``WEBOOK_TURNSTILE_SITEKEY``.
+    """
+    return _env_or(
+        "WEBOOK_TURNSTILE_SITEKEY",
+        "0x4AAAAAAAh8wjF6lP6t-zEC",
+    )
+
+
+def turnstile_solver_timeout() -> int:
+    """Maximum seconds to wait for a Turnstile token from 2Captcha."""
+    return int(_env_or("TURNSTILE_SOLVER_TIMEOUT", "180"))
+
+
+def turnstile_solver_enabled() -> bool:
+    """Master switch — when off the booking pipeline will return the
+    legacy `turnstile_required` error instead of attempting to solve."""
+    return _env_bool("TURNSTILE_SOLVER_ENABLED", True)
+
+
 # ════════════════════════════════════════════════════════════════════════
 # Backwards-compatible module-level aliases
 # ════════════════════════════════════════════════════════════════════════

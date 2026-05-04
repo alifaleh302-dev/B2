@@ -122,8 +122,14 @@ async def get_hold_token_from_webook(
     bearer: str,
     turnstile: str = "",
     time_slot_id: str = "",
+    session: Optional[aiohttp.ClientSession] = None,
 ) -> tuple[Optional[str], dict]:
     """Request a hold-token from webook.
+
+    When ``session`` is provided we reuse it so that any cf_clearance /
+    cookies set by an earlier Turnstile-bearing request stay attached
+    to the same CookieJar — which is exactly what Cloudflare expects
+    after a successful challenge.
 
     Returns (token, meta) where meta carries:
       - 'queued': bool, 'waiting_number': int, 'total_in_queue': int  (queue state)
@@ -159,14 +165,16 @@ async def get_hold_token_from_webook(
     except Exception:
         pass
 
+    own_session = session is None
+    if own_session:
+        session = aiohttp.ClientSession()
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                url, headers=headers, json=body,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as r:
-                meta["http_status"] = r.status
-                d = await _read_json(r) or {}
+        async with session.post(
+            url, headers=headers, json=body,
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as r:
+            meta["http_status"] = r.status
+            d = await _read_json(r) or {}
 
         # 422 turnstile
         if isinstance(d, dict) and d.get("errors", {}).get("turnstile"):
@@ -196,6 +204,12 @@ async def get_hold_token_from_webook(
     except Exception as e:
         log.debug(f"webook hold-token error: {e}")
         return None, meta
+    finally:
+        if own_session:
+            try:
+                await session.close()
+            except Exception:
+                pass
 
 
 # ════════════════════════════════════════════════════════════════════════
